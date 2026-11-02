@@ -1,0 +1,136 @@
+trigger:
+  branches:
+    include:
+      - dev
+      - main
+
+pr:
+  branches:
+    include:
+      - dev
+      - main
+
+variables:
+  terraformVersion: '1.16.4'
+  azureServiceConnection: 'Olist-Databricks-Platform-WIF'
+  terraformWorkingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+  backendResourceGroup: 'rg-olist-iac-dev'
+  backendStorageAccount: 'saoliststate001'
+  backendContainer: 'tfstate'
+  backendStateKey: 'olist-databricks-platform-prod.tfstate'
+  databricksHost: $(DATABRICKS_HOST)
+  databricksClientId: $(DATABRICKS_CLIENT_ID)
+  azureTenantId: $(AZURE_TENANT_ID)
+  adlsStorageAccountName: $(ADLS_STORAGE_ACCOUNT_NAME)
+  databricksAccessConnectorId: $(DATABRICKS_ACCESS_CONNECTOR_ID)
+  databricksEtlPrincipal: $(DATABRICKS_ETL_PRINCIPAL)
+
+stages:
+  - stage: Plan
+    displayName: 'Terraform Validate and Plan'
+    jobs:
+      - job: TerraformPlan
+        displayName: 'Validate and create Terraform plan'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+
+          - task: TerraformInstaller@1
+            displayName: 'Install Terraform $(terraformVersion)'
+            inputs:
+              terraformVersion: '$(terraformVersion)'
+
+          - task: AzureCLI@2
+            displayName: 'Terraform Init, Validate and Plan'
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              workingDirectory: '$(terraformWorkingDirectory)'
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+
+                terraform init \
+                  -backend-config="resource_group_name=$(backendResourceGroup)" \
+                  -backend-config="storage_account_name=$(backendStorageAccount)" \
+                  -backend-config="container_name=$(backendContainer)" \
+                  -backend-config="key=$(backendStateKey)" \
+                  -backend-config="use_azuread_auth=true"
+
+                terraform fmt -check -recursive
+                terraform validate
+
+                terraform plan -out=tfplan \
+                  -var="databricks_host=$(databricksHost)" \
+                  -var="databricks_client_id=$(databricksClientId)" \
+                  -var="azure_tenant_id=$(azureTenantId)" \
+                  -var="storage_account_name=$(adlsStorageAccountName)" \
+                  -var="access_connector_id=$(databricksAccessConnectorId)" \
+                  -var="etl_service_principal_name=$(databricksEtlPrincipal)"
+
+                mkdir -p "$(Build.ArtifactStagingDirectory)/tfplan"
+                cp tfplan "$(Build.ArtifactStagingDirectory)/tfplan/tfplan"
+            env:
+              ARM_USE_CLI: 'true'
+              DATABRICKS_AUTH_TYPE: 'azure-cli'
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Terraform plan'
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/tfplan'
+              artifact: 'terraform-plan'
+              publishLocation: 'pipeline'
+
+  - stage: Apply
+    displayName: 'Terraform Apply - Production'
+    dependsOn: Plan
+    # PR validation must never apply. Only main branch builds can deploy.
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - deployment: TerraformApply
+        displayName: 'Apply Databricks platform configuration'
+        environment: 'databricks-platform-prod'
+        pool:
+          vmImage: 'ubuntu-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: DownloadPipelineArtifact@2
+                  displayName: 'Download Terraform plan'
+                  inputs:
+                    artifact: 'terraform-plan'
+                    path: '$(Pipeline.Workspace)/terraform-plan'
+
+                - task: TerraformInstaller@1
+                  displayName: 'Install Terraform $(terraformVersion)'
+                  inputs:
+                    terraformVersion: '$(terraformVersion)'
+
+                - task: AzureCLI@2
+                  displayName: 'Terraform Init and Apply'
+                  inputs:
+                    azureSubscription: '$(azureServiceConnection)'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    workingDirectory: '$(terraformWorkingDirectory)'
+                    addSpnToEnvironment: true
+                    inlineScript: |
+                      set -euo pipefail
+
+                      terraform init \
+                        -backend-config="resource_group_name=$(backendResourceGroup)" \
+                        -backend-config="storage_account_name=$(backendStorageAccount)" \
+                        -backend-config="container_name=$(backendContainer)" \
+                        -backend-config="key=$(backendStateKey)" \
+                        -backend-config="use_azuread_auth=true"
+
+                      cp "$(Pipeline.Workspace)/terraform-plan/tfplan" ./tfplan
+                      terraform apply -auto-approve tfplan
+                  env:
+                    ARM_USE_CLI: 'true'
+                    DATABRICKS_AUTH_TYPE: 'azure-cli'
